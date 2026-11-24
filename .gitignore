@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local IDE
+.idea/
+
+# Runtime output
+debug_clicks/
+test_screen.png
+*.log
+
+# Local Android Platform Tools
+.tools/

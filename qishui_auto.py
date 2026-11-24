@@ -5,19 +5,32 @@ import time
 import random
 import re
 import os
+import shutil
+import sys
 from datetime import datetime
 
 from rapidocr_onnxruntime import RapidOCR
+
+# Windows 控制台默认可能是 GBK，强制 UTF-8 避免日志中的 emoji 导致程序退出
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
 
 # ================== 配置区 ==================
 # 目标文字（按优先级：先点靠前的）
 TARGETS = ["领取奖励", "继续观看", "领取成功"]
 # 置信度下限
 OCR_SCORE = 0.5
-# 允许的轻微识别误差（去空格后做包含/近似）
+# 允许极小的 OCR 错字（不接受广告文案中额外夹带中文）
 FUZZY = True
+# 同一目标和位置在此时间内不重复点击，防止误点广告素材文字
+DUPLICATE_CLICK_SECONDS = 6.0
 POLL_INTERVAL = 1.2
 CLICK_COOLDOWN = 2.0
+# 广告标识短暂消失时，继续按广告页等待，避免误触返回
+AD_GRACE_SECONDS = 6.0
 # 未命中时是否随机上滑（默认关，避免误滑干扰排查）
 ENABLE_RANDOM_SWIPE = False
 SWIPE_PROB = 0.12
@@ -37,8 +50,41 @@ SAVE_CLICK_DEBUG = True
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(SCRIPT_DIR, "debug_clicks")
+
+
+def find_adb():
+    """优先查找项目内置 adb，其次查找 PATH / Android SDK。"""
+    candidates = [
+        os.environ.get("ADB_PATH"),
+        os.path.join(SCRIPT_DIR, ".tools", "platform-tools", "adb.exe"),
+        shutil.which("adb"),
+    ]
+    for env_name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk_dir = os.environ.get(env_name)
+        if sdk_dir:
+            candidates.append(os.path.join(sdk_dir, "platform-tools", "adb.exe"))
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(
+            os.path.join(local_app_data, "Android", "Sdk", "platform-tools", "adb.exe")
+        )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+        resolved = shutil.which(candidate)
+        if resolved:
+            return os.path.abspath(resolved)
+    return None
+
+
+ADB_PATH = find_adb()
 ocr_engine = None
 click_seq = 0
+last_click_signature = None
+last_click_time = 0.0
 
 
 def get_ocr():
@@ -51,14 +97,70 @@ def get_ocr():
 
 
 def adb_command(cmd):
-    return subprocess.run(["adb"] + cmd, capture_output=True, text=True)
+    if not ADB_PATH:
+        raise RuntimeError("未找到 adb，请检查项目内 .tools/platform-tools/adb.exe")
+    return subprocess.run(
+        [ADB_PATH] + cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+
+
+def check_adb_connection():
+    """启动时检查 adb 与手机授权状态，给出可直接处理的中文提示。"""
+    print(f"🔎 ADB 路径: {ADB_PATH or '未找到'}")
+    if not ADB_PATH:
+        print("❌ 没有找到 adb.exe")
+        print(f"   请确认该文件存在: {os.path.join(SCRIPT_DIR, '.tools', 'platform-tools', 'adb.exe')}")
+        print("   也可安装 Android Platform Tools 后把 adb 加入 PATH。")
+        return False
+
+    result = adb_command(["devices", "-l"])
+    if result.returncode != 0:
+        print(f"❌ adb 启动失败: {result.stderr.strip() or result.stdout.strip()}")
+        return False
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    device_lines = [line for line in lines if re.match(r"^\S+\s+device\b", line)]
+    if device_lines:
+        print(f"✅ 已连接设备: {device_lines[0]}")
+        return True
+
+    unauthorized = [line for line in lines if re.search(r"\sunauthorized\b", line)]
+    if unauthorized:
+        print("⚠️ 手机已连接，但还没有授权 USB 调试。")
+        print("   请解锁手机，在弹窗中勾选“始终允许”并点击“允许”。")
+        return False
+
+    if any(re.search(r"\s(offline|no permissions)\b", line) for line in lines):
+        print("⚠️ 手机连接状态异常（offline/no permissions）。")
+        print("   请重新插拔数据线，并确认手机的 USB 调试已开启。")
+        return False
+
+    print("⚠️ 没有检测到 Android 设备。")
+    print("   1. 用数据线连接手机，并在手机上选择“传输文件/MTP”")
+    print("   2. 开启开发者选项中的“USB 调试”和“USB 安装/安全调试”")
+    print("   3. 重新运行脚本，并在手机弹窗点击“允许”")
+    return False
 
 
 def screenshot():
-    result = subprocess.run(["adb", "exec-out", "screencap", "-p"], capture_output=True)
-    if result.returncode != 0 or not result.stdout:
-        return None
+    result = subprocess.run(
+        [ADB_PATH, "exec-out", "screencap", "-p"],
+        capture_output=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"adb 截图失败: {detail or f'adb 退出码 {result.returncode}'}")
+    if not result.stdout:
+        raise RuntimeError("adb 截图失败: 没有返回图像数据")
     img = cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError("adb 截图失败: 返回的数据不是有效图片")
     return img
 
 
@@ -66,14 +168,35 @@ def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = s.strip().replace(" ", "").replace("\u3000", "")
-    # 去掉 OCR 常见尾巴符号（如「领取成功×」）
-    s = re.sub(r"[×xX✕✖×·•\|丨\[\]【】()（）\d:：]+$", "", s)
+    # 去掉 OCR 常见尾巴符号（如「领取成功×」「领取新人奖励>>」）
+    s = re.sub(r"[×xX✕✖·•\|丨\[\]【】()（）<>＞＜«»›‹\d:：]+$", "", s)
     s = re.sub(r"^[×xX✕✖·•\|丨]+", "", s)
     # 常见 OCR 混淆
     s = s.replace("领収", "领取").replace("领职", "领取").replace("领敢", "领取")
     s = s.replace("奨", "奖").replace("奬", "奖")
     s = s.replace("勵", "励")
     return s
+
+
+def is_one_edit_apart(a: str, b: str) -> bool:
+    """只容忍一个错字/漏字/多字，避免把长广告文案误判成按钮。"""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(ch1 != ch2 for ch1, ch2 in zip(a, b)) <= 1
+
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    i = j = differences = 0
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+            continue
+        differences += 1
+        if differences > 1:
+            return False
+        j += 1
+    return True
 
 
 def text_match(recognized: str, target: str) -> bool:
@@ -84,12 +207,12 @@ def text_match(recognized: str, target: str) -> bool:
     # 排除标题/倒计时等提示文字
     if any(k in a for k in ["秒", "解锁", "后可领取", "第"]):
         return False
-    if a == b or b in a:
+    if a == b:
         return True
+    # 「领取新人奖励」等广告 CTA 即使包含目标词，也不能算按钮命中
     if not FUZZY:
         return False
-    hit = sum(1 for ch in b if ch in a)
-    return hit >= len(b)
+    return is_one_edit_apart(a, b)
 
 
 def box_center(box):
@@ -201,10 +324,12 @@ def run_ocr(screen):
     return items
 
 
-def find_and_click(screen):
+def find_and_click(screen, items=None):
     """识别目标文字并点击。命中返回目标字符串，未命中返回 None"""
+    global last_click_signature, last_click_time
     sh, sw = screen.shape[:2]
-    items = run_ocr(screen)
+    if items is None:
+        items = run_ocr(screen)
 
     if not items:
         print("· OCR 无结果")
@@ -244,6 +369,14 @@ def find_and_click(screen):
 
         score, cx, cy, text = candidates[0]
         x, y = int(round(cx)), int(round(cy))
+        signature = (target, round(x / 30), round(y / 30))
+        now = time.monotonic()
+        if signature == last_click_signature and now - last_click_time < DUPLICATE_CLICK_SECONDS:
+            print(f"· 跳过重复点击「{text}」@({x},{y})，疑似广告素材文字")
+            continue
+
+        last_click_signature = signature
+        last_click_time = now
         log_click(screen, target, text, score, x, y, candidates)
         adb_command(["shell", "input", "tap", str(x), str(y)])
         return target
@@ -260,7 +393,12 @@ print(f"   目标: {TARGETS}  置信度>={OCR_SCORE}  轮询={POLL_INTERVAL}s")
 print(f"   点击调试图目录: {DEBUG_DIR}")
 print(f"   无冷却目标: {sorted(NO_COOLDOWN_TARGETS)}")
 
+if not check_adb_connection():
+    print("❌ 脚本已停止：请按上面的提示处理 ADB 连接后重新运行。")
+    raise SystemExit(1)
+
 miss_count = 0
+ad_grace_until = 0.0
 while True:
     try:
         screen = screenshot()
@@ -270,13 +408,35 @@ while True:
             continue
 
         sh_h = screen.shape[0]
-        is_live = any(text in ["关注", "更多直播"] and cy < sh_h * 0.25 for text, score, cx, cy in run_ocr(screen))
+        items = run_ocr(screen)
+        normalized_texts = [normalize_text(text) for text, score, cx, cy in items]
+
+        # 广告页顶部通常带「广告」或「反馈」，倒计时会显示「20秒后可领取奖励」。
+        # 这类页面需要耐心等待，不能套用“连续未匹配就返回”的兜底逻辑。
+        is_ad_page = any(
+            (
+                normalize_text(item_text).startswith("广告")
+                or normalize_text(item_text) == "反馈"
+            )
+            and cy < sh_h * 0.18
+            for item_text, score, cx, cy in items
+        )
+        is_ad_countdown = any("秒后可领取" in t or "秒后继续观看" in t for t in normalized_texts)
+        if is_ad_page or is_ad_countdown:
+            ad_grace_until = time.monotonic() + AD_GRACE_SECONDS
+
+        is_ad_waiting = time.monotonic() < ad_grace_until
+        is_live = not is_ad_waiting and any(
+            text in ["关注", "更多直播"] and cy < sh_h * 0.25
+            for text, score, cx, cy in items
+        )
         if is_live:
             print("⚡ 检测到顶部[关注/更多直播]，秒退直播间！")
             adb_command(["shell", "input", "keyevent", "4"])
             time.sleep(1.5)
             continue
-        clicked = find_and_click(screen)
+
+        clicked = find_and_click(screen, items)
         if clicked:
             miss_count = 0
         if clicked:
@@ -284,6 +444,12 @@ while True:
                 print(f"⚡ 「{clicked}」已点，跳过等待，立即继续识别")
                 continue
             time.sleep(CLICK_COOLDOWN)
+            continue
+
+        if is_ad_waiting:
+            miss_count = 0
+            print("· 广告播放/倒计时中，继续等待")
+            time.sleep(POLL_INTERVAL)
             continue
 
         if ENABLE_RANDOM_SWIPE and random.random() < SWIPE_PROB:
